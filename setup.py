@@ -12,7 +12,7 @@ setup(name='loginjector',
       packages=['loginjector'],
       entry_points={
           'console_scripts': [
-              'loginjector_daemon = loginjector.loginjector:cli',
+              'loginjector_daemon = loginjector.loginjector:shell',
           ]
       },
       #install_requires=['requests==2.10.0']
