@@ -26,7 +26,7 @@ $WorkDirectory /var/spool/rsyslog
 # Provide file listening
 #
 
-$ModLoad imfile
+module(load="imfile" mode="inotify")
 
 #
 # Begin logs
@@ -37,19 +37,19 @@ $ModLoad imfile
 # {{ logfile }}
 #
 
-$InputFileName {{ logfile.path }}
-$InputFileTag {{ logfile.program }}
-$InputFileStateFile {{ logfile.statefile }}
-$InputFileSeverity {{ logfile.level }}
-$InputFileFacility local3
-$InputRunFileMonitor
+input(type="imfile"
+      File="{{ logfile.path }}"
+      statefile="{{ logfile.statefile }}"
+      Tag="{{ logfile.program }}"
+      Severity="{{ logfile.program }}"
+      facility="local0")
 
 {% endfor %}
 #
 # Where will this be sent?
 #
 
-local3.* @@{{ dest_ip }}:{{ dest_port }}
+local0.* @{{ dest_ip }}:{{ dest_port }}
 
 *.*  /var/log/syslog
 
