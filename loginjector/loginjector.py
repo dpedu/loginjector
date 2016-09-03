@@ -17,6 +17,9 @@ DEFAULT_TEMPLATE = """
 $PrivDropToUser syslog
 $PrivDropToGroup syslog
 
+$template myFormat,"%rawmsg%\\n"
+# $ActionFileDefaultTemplate myFormat
+
 #
 # Where to place spool and state files
 #
@@ -26,7 +29,7 @@ $WorkDirectory /var/spool/rsyslog
 # Provide file listening
 #
 
-module(load="imfile" mode="inotify")
+module(load="imfile")
 
 #
 # Begin logs
@@ -44,12 +47,12 @@ input(type="imfile"
       Severity="{{ logfile.program }}"
       facility="local0")
 
-{% endfor %}
-#
-# Where will this be sent?
-#
+if ($syslogtag == "{{ logfile.program }}") then {
+    local0.* @{{ logfile.dest_ip }}:{{ logfile.dest_port }};myFormat
+}
 
-local0.* @{{ dest_ip }}:{{ dest_port }}
+
+{% endfor %}
 
 *.*  /var/log/syslog
 
@@ -63,7 +66,7 @@ def shell():
     parser = argparse.ArgumentParser(description="Python logging daemon")
     parser.add_argument('-s', '--socket', required=True, help="Path or URL to docker daemon socket")
     parser.add_argument('-t', '--template', required=False, help="Path to syslog template")
-    parser.add_argument('-d', '--dest', required=True, help="Logs destination IP 1.2.3.4:xxxx", type=lambda x: x.split(":"))
+    #parser.add_argument('-d', '--dest', required=True, help="Logs destination IP 1.2.3.4:xxxx", type=lambda x: x.split(":"))
 
     args = parser.parse_args()
 
@@ -176,16 +179,16 @@ class LogInjectorDaemon(object):
                               "level": path["level"],
                               "statefile":"mod-{}-{}-{}.state".format(mod,
                                                                       os.path.basename(path["path"]),
-                                                                      path["level"])}]
+                                                                      path["level"]),
+                              "dest_ip": self.dest[0], # TODO different dest per log
+                              "dest_port": self.dest[1]}] # TODO different port per log
 
         if len(logfiles) == 0:
             logging.info("{}: no log files found, exiting".format(container_id))
             return
 
         # generate syslog config
-        syslog_conf = Environment().from_string(self.template).render(logfiles=logfiles,
-                                                                      dest_ip=self.dest[0],
-                                                                      dest_port=self.dest[1])
+        syslog_conf = Environment().from_string(self.template).render(logfiles=logfiles)
 
         # transfer syslog conf
         self.write_in_container(container_id, "/etc/rsyslog.conf", syslog_conf)
