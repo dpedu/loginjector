@@ -17,50 +17,7 @@ from docker import Client
 
 from jinja2 import Environment
 
-
-DEFAULT_TEMPLATE = """
-$PrivDropToUser syslog
-$PrivDropToGroup syslog
-
-$template myFormat,"%rawmsg%\\n"
-# $ActionFileDefaultTemplate myFormat
-
-#
-# Where to place spool and state files
-#
-$WorkDirectory /var/spool/rsyslog
-
-#
-# Provide file listening
-#
-
-module(load="imfile")
-
-#
-# Begin logs
-#
-
-{% for logfile in logfiles %}
-#
-# {{ logfile }}
-#
-
-input(type="imfile"
-      File="{{ logfile.path }}"
-      statefile="{{ logfile.statefile }}"
-      Tag="{{ logfile.program }}-{{ logfile.logname }}"
-      Severity="{{ logfile.program }}"
-      facility="local0")
-
-if ($syslogtag == "{{ logfile.program }}-{{ logfile.logname }}") then {
-    local0.* @{{ logfile.dest_ip }}:{{ logfile.dest_port }};myFormat
-}
-
-{% endfor %}
-
-*.*  /var/log/syslog
-
-"""
+from loginjector.template import DEFAULT_TEMPLATE
 
 
 def shell():
@@ -69,9 +26,10 @@ def shell():
     [logging.getLogger(mute).setLevel(logging.ERROR) for mute in ["docker", "requests"]]
 
     parser = argparse.ArgumentParser(description="Python logging daemon")
-    parser.add_argument('-s', '--socket', required=True, help="Path or URL to docker daemon socket")
+    parser.add_argument('-s', '--socket', default="unix://var/run/docker.sock",
+                        help="Path or URL to docker daemon socket")
     # parser.add_argument('-t', '--template', required=False, help="Path to syslog template")
-    parser.add_argument('-o', '--output', required=True, help="Path to host log output dir")
+    parser.add_argument('-o', '--output', default="/var/log/container/", help="Path to host log output dir")
 
     args = parser.parse_args()
 
@@ -132,10 +90,7 @@ class LogInjectorDaemon(object):
 
     def run(self):
         """
-        Start all service threads:
-
-        change_listner: subscribes to docker's event api and listens for containers stopping/starting
-        message_recvr: udp listener that receives log messages from containers
+        Start all service threads and init listeners on preexisting containers
         """
 
         change_listner = Thread(target=self.listen_events, daemon=True)
@@ -144,6 +99,7 @@ class LogInjectorDaemon(object):
         message_recvr = Thread(target=self.listen_udp, daemon=True)
         message_recvr.start()
 
+        # Get listing of existing containers and spawn the log listener on each
         containers = self.docker.containers()
 
         for container in containers:
@@ -162,9 +118,9 @@ class LogInjectorDaemon(object):
 
     def listen_udp(self):
         """
-        Loop through active loggers. If there's data on the line, read it. This is meant to be ran as a Thread
+        UDP listener thread. Loop through active loggers. If there's data on the line, read it
         """
-        while True:
+        while self.alive:
             with self.loggers_lock:
                 socket_fnos = list(self.loggers.keys())
                 readable, _, dead = select(socket_fnos, [], socket_fnos, 0.2)
@@ -191,20 +147,24 @@ class LogInjectorDaemon(object):
             os.fsync(f.fileno())  # is this necessary since we're closing the file?l
 
     def listen_events(self):
-        try:
-            for e in self.docker.events(filters=LogInjectorDaemon.EVENT_FILTERS_STOPSTART):
-                event = json.loads(e.decode('UTF-8'))
-                # logging.info("event: {}".format(str(event)))
-                if event["status"] == "start":
-                    logging.info("{}: got start event".format(event["id"]))
-                    Thread(target=self.relisten_on, args=(event["id"],)).start()
+        """
+        Docker change listener thread. Subscribes to docker's event api and respond to containers stopping/starting
+        """
+        for e in self.docker.events(filters=LogInjectorDaemon.EVENT_FILTERS_STOPSTART):
+            event = json.loads(e.decode('UTF-8'))
+            self.handle_event(event)
 
-                elif event["status"] == "stop":
-                    logging.info("{}: got stop event".format(event["id"]))
-                    Thread(target=self.end_listen_on, args=(event["id"],)).start()
+    def handle_event(self, event):
+        """
+        Handle an event received from docker
+        """
+        logging.info("{}: got {} event".format(event["id"], event["status"]))
 
-        except KeyboardInterrupt:
-            logging.warning("Stopped listening for events")
+        if event["status"] == "start":
+            Thread(target=self.relisten_on, args=(event["id"],)).start()
+
+        elif event["status"] == "stop":
+            Thread(target=self.end_listen_on, args=(event["id"],)).start()
 
     def end_listen_on(self, container_id):
         """
@@ -251,12 +211,31 @@ class LogInjectorDaemon(object):
         modules_found = self.find_logs(ps_lines)
         logging.info("{}: logs detected: {}".format(container_id, str(modules_found)))
 
-        modules_use = self.use_builtins.intersection({k for k, v in modules_found.items() if v})
+        modules_use = list(self.use_builtins.intersection({k for k, v in modules_found.items() if v}))
         logging.info("{}: using: {}".format(container_id, str(modules_use)))
 
-        logfiles = []
-        for mod in modules_use:
+        if len(modules_use) == 0:
+            logging.info("{}: no log files found, exiting".format(container_id))
+            return None
 
+        syslog_conf = self.render_template(container_id, self.template, modules_use)
+
+        # transfer syslog conf
+        self.write_in_container(container_id, "/etc/rsyslog.conf", syslog_conf)
+
+        # start syslog
+        logging.info("{}: spawning rsyslogd".format(container_id))
+        self.exec_in_container(container_id, '/usr/sbin/rsyslogd')
+
+    def render_template(self, container_id, template_contents, log_modules):
+        """
+        Create a rsyslog config from template
+        """
+
+        # prepare template vars - only a list of detected log files
+        logfiles = []
+
+        for mod in log_modules:
             for path in self.detectors[mod].paths:
                 original_logname = os.path.basename(path["path"])
                 # add local listener
@@ -273,19 +252,8 @@ class LogInjectorDaemon(object):
                               "dest_port": new_port,
                               "container_id": container_id}]
 
-        if len(logfiles) == 0:
-            logging.info("{}: no log files found, exiting".format(container_id))
-            return
-
         # generate syslog config
-        syslog_conf = Environment().from_string(self.template).render(logfiles=logfiles)
-
-        # transfer syslog conf
-        self.write_in_container(container_id, "/etc/rsyslog.conf", syslog_conf)
-
-        # start syslog
-        logging.info("{}: spawning rsyslogd".format(container_id))
-        self.exec_in_container(container_id, '/usr/sbin/rsyslogd')
+        return Environment().from_string(template_contents).render(logfiles=logfiles)
 
     def get_container_name(self, container_id):
         container_info = self.docker.inspect_container(container_id)
@@ -295,19 +263,15 @@ class LogInjectorDaemon(object):
         # strip leading slash
         raw_name = raw_name[1:]
 
-        # hacky lazy loading
+        # hack: lazy loading of bridge ip - we must listen for udp packets on the docker bridge interface, so we need
+        # the IP for binding. Lazily set it after the first container is fetched from the docker host, as this will
+        # always happen before any udp binding
         if not self.docker_bridge_ip:
-            self.set_bridge_ip(container_info["NetworkSettings"]["Networks"]["bridge"]["Gateway"])
+            bridge_ip = container_info["NetworkSettings"]["Networks"]["bridge"]["Gateway"]
+            logging.info("Found bridge ip: {}".format(bridge_ip))
+            self.docker_bridge_ip = bridge_ip
 
         return raw_name
-
-    def set_bridge_ip(self, bridge_ip):
-        """
-        We must listen for udp packets on the docker bridge interface, so we need the IP for binding. Lazily set it
-        after the first container is fetched from the docker host, as this will always happen before any udp binding
-        """
-        logging.info("Found bridge ip: {}".format(bridge_ip))
-        self.docker_bridge_ip = bridge_ip
 
     def add_udp_listener(self, container_id, program, original_logname):
         """
@@ -346,16 +310,19 @@ class LogInjectorDaemon(object):
 
         return {name: hits[name] for name in self.detectors.keys()}
 
-    def exec_in_container(self, container, cmd):
-        e = self.docker.exec_create(container=container, cmd=cmd)
+    def exec_in_container(self, container_id, cmd_str):
+        """
+        Execute a command in a container
+        """
+        e = self.docker.exec_create(container=container_id, cmd=cmd_str)
         return self.docker.exec_start(e["Id"])
 
-    def write_in_container(self, container, path, contents):
+    def write_in_container(self, container_id, path, contents):
         """
         This is ugly and sucks
         """
 
-        logging.info("{}: writing {} bytes to container's {}".format(container, len(contents), path))
+        logging.info("{}: writing {} bytes to container's {}".format(container_id, len(contents), path))
 
         if type(contents) != bytes:
             contents = contents.encode('UTF-8')
@@ -367,7 +334,7 @@ class LogInjectorDaemon(object):
             chunk = []
             for byte in contents[chunk_size * i:chunk_size * i + chunk_size]:
                 chunk.append('\\\\x' + hex(byte)[2:])
-            self.exec_in_container(container,
+            self.exec_in_container(container_id,
                                    "bash -c -- 'printf {} {} {}'".format(''.join(chunk),
                                                                          ">" if i == 0 else ">>",
                                                                          path))
