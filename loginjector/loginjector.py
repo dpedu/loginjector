@@ -1,18 +1,19 @@
 
+import os
 import math
 import json
-import os
+import signal
 import socket
 import logging
 import argparse
 
-from select import select
-from collections import defaultdict, namedtuple
-from threading import Thread, Lock
 from time import sleep
+from select import select
+from threading import Thread, Lock
+from collections import defaultdict, namedtuple
 
-from docker import Client
 from docker import tls  # NOQA
+from docker import Client
 
 from jinja2 import Environment
 
@@ -123,8 +124,19 @@ class LogInjectorDaemon(object):
         self.loggers_lock = Lock()
         self.container_names = {}
 
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+    def signal_handler(self, signum, frame):
+        logging.warning("Got signal {}, setting exit flag".format(signum))
+        self.alive = False
+
     def run(self):
-        containers = self.docker.containers()
+        """
+        Start all service threads:
+
+        change_listner: subscribes to docker's event api and listens for containers stopping/starting
+        message_recvr: udp listener that receives log messages from containers
+        """
 
         change_listner = Thread(target=self.listen_events, daemon=True)
         change_listner.start()
@@ -132,12 +144,15 @@ class LogInjectorDaemon(object):
         message_recvr = Thread(target=self.listen_udp, daemon=True)
         message_recvr.start()
 
+        containers = self.docker.containers()
+
         for container in containers:
             Thread(target=self.relisten_on, args=(container["Id"],)).start()
 
         try:
             while self.alive:
-                change_listner.join()
+                change_listner.join(0.1)
+                message_recvr.join(0.1)
         except KeyboardInterrupt:
             pass
 
