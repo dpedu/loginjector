@@ -24,7 +24,7 @@ entires sent by containers and writes them to disk on the host.
 
 **Running**
 
-* `loginjector_daemon -s unix://var/run/docker.sock -o /var/log/container/`
+* `loginjector -s unix://var/run/docker.sock -o /var/log/container/`
 
 (The above arguments are actually the defaults and need not be specified)
 
